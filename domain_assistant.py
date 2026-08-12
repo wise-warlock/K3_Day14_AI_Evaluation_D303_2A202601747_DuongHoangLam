@@ -288,14 +288,26 @@ class GroundedFallbackGenerator:
 
 
 class OpenAIGenerator:
-    def __init__(self, max_output_tokens: int = 300) -> None:
-        api_key = os.getenv("OPENAI_API_KEY", "").strip()
-        self.model = os.getenv("OPENAI_MODEL", "").strip()
+    def __init__(self, max_output_tokens: int = 500) -> None:
+        api_key = (os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
+        base_url = (os.getenv("GROQ_BASE_URL") or os.getenv("OPENAI_BASE_URL") or "").strip()
+        self.model = (os.getenv("GROQ_MODEL") or os.getenv("OPENAI_MODEL") or "llama-3.3-70b-versatile").strip()
+
+        # Clean enclosing quotes from .env if present
+        self.model = self.model.strip('"\'')
+        if base_url:
+            base_url = base_url.strip('"\'')
+        elif api_key.startswith("gsk_"):
+            base_url = "https://api.groq.com/openai/v1"
+
         if not api_key:
-            raise RuntimeError("OPENAI_API_KEY is missing from .env")
-        if not self.model:
-            raise RuntimeError("OPENAI_MODEL is missing from .env")
-        self.client = OpenAI(api_key=api_key, max_retries=0)
+            raise RuntimeError("Neither GROQ_API_KEY nor OPENAI_API_KEY found in .env")
+
+        kwargs: dict[str, Any] = {"api_key": api_key, "max_retries": 1}
+        if base_url:
+            kwargs["base_url"] = base_url
+
+        self.client = OpenAI(**kwargs)
         self.max_output_tokens = max_output_tokens
         self._disabled = False
 
@@ -303,18 +315,19 @@ class OpenAIGenerator:
         if self._disabled:
             return GroundedFallbackGenerator().generate(prompt)
         try:
-            response = self.client.responses.create(
+            response = self.client.chat.completions.create(
                 model=self.model,
-                input=prompt,
+                messages=[{"role": "user", "content": prompt}],
                 temperature=0,
-                max_output_tokens=self.max_output_tokens,
+                max_tokens=self.max_output_tokens,
             )
-            answer = response.output_text.strip()
+            raw_content = response.choices[0].message.content or ""
+            answer = re.sub(r"<think>.*?</think>", "", raw_content, flags=re.DOTALL).strip()
             if not answer:
-                raise RuntimeError("OpenAI returned an empty answer")
+                raise RuntimeError("LLM returned an empty answer")
             return answer
         except Exception as exc:
-            print(f"\n[Warning] OpenAI API call failed ({exc}); switching to GroundedFallbackGenerator for remaining questions.", flush=True)
+            print(f"\n[Warning] LLM API call failed ({exc}); switching to GroundedFallbackGenerator for remaining questions.", flush=True)
             self._disabled = True
             return GroundedFallbackGenerator().generate(prompt)
 
@@ -350,8 +363,9 @@ class DomainAssistant:
     ) -> DomainAssistant:
         corpus_id, chunks = load_corpus(corpus_dir)
         if generator is None:
-            api_key = os.getenv("OPENAI_API_KEY", "").strip()
-            if not api_key or api_key == "your_openai_api_key_here":
+            groq_key = os.getenv("GROQ_API_KEY", "").strip()
+            openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+            if not groq_key and (not openai_key or openai_key == "your_openai_api_key_here"):
                 generator = GroundedFallbackGenerator()
             else:
                 try:
